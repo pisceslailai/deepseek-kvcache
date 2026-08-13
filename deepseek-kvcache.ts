@@ -48,7 +48,15 @@ export default function deepseekKvCache(pi: ExtensionAPI) {
 	const isDeepSeek = (provider?: string, modelId?: string): boolean =>
 		provider === "deepseek" || /deepseek/i.test(modelId ?? "");
 
-	let lastPayload: WirePayload | undefined;
+	let cache:
+		| {
+				payload: WirePayload;
+				provider?: string;
+				modelId?: string;
+				baseUrl?: string;
+				authHeader?: string;
+			}
+		| undefined;
 	let authHeader: string | undefined;
 
 	const stats = {
@@ -61,31 +69,52 @@ export default function deepseekKvCache(pi: ExtensionAPI) {
 		fallbacks: 0, // 退回 pi 默认压缩的次数
 	};
 
-	// 1. 缓存主对话请求的 wire payload（agent 主请求必有 tools）
+	// 1. 缓存主对话请求的 wire payload（agent 主请求必有 tools），
+	//    连同 provider/modelId/baseUrl/key 绑定为同一份快照，
+	//    压缩前精确匹配，避免切换厂商/端点后复用旧 payload 和旧密钥
 	pi.on("before_provider_request", (event, ctx) => {
 		if (!isDeepSeek(ctx.model?.provider, ctx.model?.id)) return;
 		const payload = event.payload as WirePayload | undefined;
 		if (!payload || !Array.isArray(payload.messages) || payload.messages.length < 3) return;
 		if (!Array.isArray(payload.tools) || payload.tools.length === 0) return;
-		lastPayload = structuredClone(payload);
+		cache = {
+			payload: structuredClone(payload),
+			provider: ctx.model?.provider,
+			modelId: ctx.model?.id,
+			baseUrl: ctx.model?.baseUrl,
+			authHeader,
+		};
 	});
 
-	// 2. 缓存 Authorization 头，摘要请求复用同一密钥
+	// 2. 缓存 Authorization 头；若已有快照但缺密钥则补上（同一请求代）
 	pi.on("before_provider_headers", (event, ctx) => {
 		if (!isDeepSeek(ctx.model?.provider, ctx.model?.id)) return;
 		const auth = event.headers.authorization ?? event.headers["Authorization"];
-		if (typeof auth === "string" && auth.length > 0) authHeader = auth;
+		if (typeof auth === "string" && auth.length > 0) {
+			authHeader = auth;
+			if (cache && !cache.authHeader) cache.authHeader = auth;
+		}
 	});
 
 	// 3. 压缩：摘要请求 = 主对话前缀（逐字不变）+ 尾部指令 → 前缀整体命中缓存
 	pi.on("session_before_compact", async (event, ctx) => {
 		const { preparation, signal } = event;
-		if (!lastPayload?.messages?.length || !authHeader) return; // 无缓存/密钥 → 退回 pi 默认
-		if (lastPayload.model !== ctx.model?.id) return; // 模型已切换 → 缓存不适用
+		// 无缓存/密钥 → 退回 pi 默认
+		if (!cache?.payload?.messages?.length || !cache.authHeader) return;
+		// 显式确认当前仍是 DeepSeek 路由
+		if (!isDeepSeek(ctx.model?.provider, ctx.model?.id)) return;
+		// 快照精确匹配：provider + modelId + baseUrl 任一变化都放弃缓存
+		if (
+			cache.provider !== ctx.model?.provider ||
+			cache.modelId !== ctx.model?.id ||
+			cache.baseUrl !== ctx.model?.baseUrl
+		) {
+			return;
+		}
 
 		const payload: WirePayload = {
-			...lastPayload, // 键序保持：model, messages, tools, ... → 前缀逐字一致
-			messages: [...lastPayload.messages, { role: "user", content: buildInstruction(preparation) }],
+			...cache.payload, // 键序保持：model, messages, tools, ... → 前缀逐字一致
+			messages: [...cache.payload.messages, { role: "user", content: buildInstruction(preparation) }],
 			stream: false,
 			max_tokens: SUMMARY_MAX_TOKENS,
 			// thinking 位于 body 尾部，不影响 messages 前缀命中；摘要无需推理
@@ -96,7 +125,7 @@ export default function deepseekKvCache(pi: ExtensionAPI) {
 		try {
 			const res = await fetch(`${baseUrl}/chat/completions`, {
 				method: "POST",
-				headers: { "content-type": "application/json", authorization: authHeader },
+				headers: { "content-type": "application/json", authorization: cache.authHeader },
 				body: JSON.stringify(payload),
 				signal,
 			});
