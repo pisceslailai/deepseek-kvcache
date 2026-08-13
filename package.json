@@ -1,0 +1,37 @@
+{
+  "name": "deepseek-kvcache",
+  "version": "1.0.0",
+  "description": "DeepSeek KV Cache optimization extension for the Pi coding agent: compaction summaries reuse the main-conversation prefix to hit DeepSeek's automatic prefix cache (~50x cheaper per compaction)",
+  "type": "module",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/pisceslailai/deepseek-kvcache.git"
+  },
+  "keywords": [
+    "pi-package",
+    "pi",
+    "coding-agent",
+    "deepseek",
+    "kvcache",
+    "context-caching",
+    "compaction"
+  ],
+  "license": "MIT",
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "pi": {
+    "extensions": [
+      "./deepseek-kvcache.ts"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": ">=0.80.10"
+  },
+  "devDependencies": {
+    "tsx": "^4.22.0"
+  },
+  "scripts": {
+    "test": "node --import tsx test/dskv-test.mts"
+  }
+}
