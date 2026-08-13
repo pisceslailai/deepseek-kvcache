@@ -69,6 +69,19 @@ export default function deepseekKvCache(pi: ExtensionAPI) {
 		fallbacks: 0, // 退回 pi 默认压缩的次数
 	};
 
+	/** 渲染 footer 状态行：dshkv ↑输入 R缓存命中 命中率 | cmp 压缩命中率 */
+	const renderStatus = (ctx: { ui?: { setStatus(key: string, text: string | undefined): void } }): void => {
+		const total = stats.inputTokens + stats.cacheReadTokens;
+		const hitRate = total > 0 ? `${((stats.cacheReadTokens / total) * 100).toFixed(1)}%` : "-";
+		const parts = [`↑${fmtT(stats.inputTokens)}`, `R${fmtT(stats.cacheReadTokens)}`, hitRate];
+		if (stats.compactRequests > 0) {
+			const cTotal = stats.compactInput + stats.compactCacheRead;
+			const cRate = cTotal > 0 ? `${((stats.compactCacheRead / cTotal) * 100).toFixed(1)}%` : "-";
+			parts.push(`| cmp ${cRate}`);
+		}
+		ctx.ui?.setStatus?.("dshkv", `dshkv ${parts.join(" ")}`);
+	};
+
 	// 1. 缓存主对话请求的 wire payload（agent 主请求必有 tools），
 	//    连同 provider/modelId/baseUrl/key 绑定为同一份快照，
 	//    压缩前精确匹配，避免切换厂商/端点后复用旧 payload 和旧密钥
@@ -149,6 +162,7 @@ export default function deepseekKvCache(pi: ExtensionAPI) {
 			stats.compactRequests++;
 			stats.compactCacheRead += cacheRead;
 			stats.compactInput += Math.max(0, input);
+			renderStatus(ctx);
 
 			return {
 				compaction: {
@@ -164,7 +178,7 @@ export default function deepseekKvCache(pi: ExtensionAPI) {
 		}
 	});
 
-	// 4. 统计主对话请求的缓存命中
+	// 4. 统计主对话请求的缓存命中，并实时更新 footer 状态行
 	pi.on("message_end", (event, ctx) => {
 		if (!isDeepSeek(ctx.model?.provider, ctx.model?.id)) return;
 		const usage = event.message?.usage;
@@ -172,6 +186,7 @@ export default function deepseekKvCache(pi: ExtensionAPI) {
 		stats.requests++;
 		stats.inputTokens += usage.input ?? 0;
 		stats.cacheReadTokens += usage.cacheRead ?? 0;
+		renderStatus(ctx);
 	});
 
 	// 5. /dshkv 查看命中统计
@@ -241,4 +256,13 @@ function toPiUsage(usage?: DeepSeekUsage) {
 
 function fmt(n: number): string {
 	return n.toLocaleString("en-US");
+}
+
+/** 与 pi 默认 footer 一致的 token 缩写（1.2k / 45M） */
+function fmtT(n: number): string {
+	if (n < 1000) return n.toString();
+	if (n < 10000) return `${(n / 1000).toFixed(1)}k`;
+	if (n < 1000000) return `${Math.round(n / 1000)}k`;
+	if (n < 10000000) return `${(n / 1000000).toFixed(1)}M`;
+	return `${Math.round(n / 1000000)}M`;
 }

@@ -17,6 +17,7 @@ pi 的压缩（compaction）默认把旧消息序列化成 `[User]: ...` 文本�
 - `before_provider_request`：缓存主对话请求的完整 wire payload（system + messages + tools 逐字保留）
 - `session_before_compact`：接管压缩——摘要请求 = 主对话前缀 + 尾部指令，`stream: false`、`max_tokens: 8192`、`thinking: disabled`
 - `/dshkv`：缓存命中统计（主对话命中率、压缩前缀复用命中率、累计节省金额）
+- footer 状态行：`dshkv ↑输入 R缓存命中 命中率 | cmp 压缩命中率`，随每次请求实时更新（`ctx.ui.setStatus`，保留默认 footer）
 - 仅对 DeepSeek 路由生效（`provider === "deepseek"` 或模型 id 含 `deepseek`）；自定义网关自动使用 `ctx.model.baseUrl`
 - 任何失败静默回退 pi 默认压缩，不影响功能
 
