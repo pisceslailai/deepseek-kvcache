@@ -69,8 +69,13 @@ export default function deepseekKvCache(pi: ExtensionAPI) {
 		fallbacks: 0, // 退回 pi 默认压缩的次数
 	};
 
-	/** 渲染 footer 状态行：dshkv ↑输入 R缓存命中 命中率 | cmp 压缩命中率 */
-	const renderStatus = (ctx: { ui?: { setStatus(key: string, text: string | undefined): void } }): void => {
+	/** 渲染状态：footer 状态行 + 编辑器下方 widget（与 footer 组件解耦，任何主题/自定义 footer 下都可见） */
+	const renderStatus = (ctx: {
+		ui?: {
+			setStatus?(key: string, text: string | undefined): void;
+			setWidget?(key: string, content: string[] | undefined, options?: { placement?: string }): void;
+		};
+	}): void => {
 		const total = stats.inputTokens + stats.cacheReadTokens;
 		const hitRate = total > 0 ? `${((stats.cacheReadTokens / total) * 100).toFixed(1)}%` : "-";
 		const parts = [`↑${fmtT(stats.inputTokens)}`, `R${fmtT(stats.cacheReadTokens)}`, hitRate];
@@ -79,7 +84,9 @@ export default function deepseekKvCache(pi: ExtensionAPI) {
 			const cRate = cTotal > 0 ? `${((stats.compactCacheRead / cTotal) * 100).toFixed(1)}%` : "-";
 			parts.push(`| cmp ${cRate}`);
 		}
-		ctx.ui?.setStatus?.("dshkv", `dshkv ${parts.join(" ")}`);
+		const text = `dshkv ${parts.join(" ")}`;
+		ctx.ui?.setStatus?.("dshkv", text);
+		ctx.ui?.setWidget?.("dshkv", [text], { placement: "belowEditor" });
 	};
 
 	// 1. 缓存主对话请求的 wire payload（agent 主请求必有 tools），

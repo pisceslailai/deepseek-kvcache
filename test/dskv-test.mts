@@ -148,7 +148,7 @@ console.log(`  注册事件: ${[...hooks.keys()].join(", ")}`);
 
 const ctxMock: any = {
 	model: { provider: "deepseek", id: MODEL, baseUrl: "https://api.deepseek.com" },
-	ui: { setStatus: () => {} },
+	ui: { setStatus: () => {}, setWidget: () => {} },
 };
 
 hooks.get("before_provider_request")!({ payload: structuredClone(reqA) }, ctxMock);
