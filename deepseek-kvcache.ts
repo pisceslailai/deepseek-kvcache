@@ -1,25 +1,18 @@
 /**
  * DeepSeek KV Cache 优化扩展
  *
- * 针对 DeepSeek 自动前缀缓存（context caching，命中价约为全价 1/50）的工程优化：
+ * 针对 DeepSeek 自动前缀缓存的工程优化：
  *
  * 1. before_provider_request 缓存主对话请求的完整 wire payload
  *    （system + messages + tools 逐字保留）
- * 2. session_before_compact 接管压缩摘要请求：摘要请求 = 主对话前缀
- *    （逐字不变）+ 尾部追加摘要指令 → 公共前缀整体命中缓存
- *    与 dsh 的 compaction-basic 回放前缀策略一致
- * 3. /dshkv 命令查看缓存命中统计，验证优化是否生效
- *
- * 安装：
- *   - 本文件位于 ~/.pi/agent/extensions/，并在 ~/.pi/agent/settings.json
- *     的 "extensions" 数组加入该路径（或 --extension 参数加载）
- *   - /reload 热重载
- *
- * 验证：运行 /dshkv，观察压缩请求的缓存命中率；或对比压缩前后
- * usage 中的 cache_read_tokens / prompt_cache_hit_tokens。
+ * 2. session_before_compact 根据 Pi preparation.messagesToSummarize /
+ *    turnPrefixMessages 精确计算需要摘要的消息范围，只回放该 wire 前缀并追加摘要指令
+ * 3. 边界无法与 wire payload 安全对齐时，直接回退 Pi 默认 compaction，正确性优先
+ * 4. /dshkv 命令查看缓存命中统计
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { convertToLlm } from "@earendil-works/pi-coding-agent";
 
 interface WireMessage {
 	role: string;
@@ -60,16 +53,16 @@ export default function deepseekKvCache(pi: ExtensionAPI) {
 	let authHeader: string | undefined;
 
 	const stats = {
-		requests: 0, // 主对话请求数
-		inputTokens: 0, // 主对话未命中输入
-		cacheReadTokens: 0, // 主对话缓存命中
-		compactRequests: 0, // 前缀复用压缩请求数
-		compactCacheRead: 0, // 压缩请求缓存命中
-		compactInput: 0, // 压缩请求未命中输入
-		fallbacks: 0, // 退回 pi 默认压缩的次数
+		requests: 0,
+		inputTokens: 0,
+		cacheReadTokens: 0,
+		compactRequests: 0,
+		compactCacheRead: 0,
+		compactInput: 0,
+		fallbacks: 0,
 	};
 
-	/** 渲染状态：footer 状态行 + 编辑器下方 widget（与 footer 组件解耦，任何主题/自定义 footer 下都可见） */
+	/** 渲染状态：footer 状态行 + 编辑器下方 widget。 */
 	const renderStatus = (ctx: {
 		ui?: {
 			setStatus?(key: string, text: string | undefined): void;
@@ -89,9 +82,7 @@ export default function deepseekKvCache(pi: ExtensionAPI) {
 		ctx.ui?.setWidget?.("dshkv", [text], { placement: "belowEditor" });
 	};
 
-	// 1. 缓存主对话请求的 wire payload（agent 主请求必有 tools），
-	//    连同 provider/modelId/baseUrl/key 绑定为同一份快照，
-	//    压缩前精确匹配，避免切换厂商/端点后复用旧 payload 和旧密钥
+	// 1. 缓存主对话请求 wire payload，并绑定 provider/model/baseUrl/key。
 	pi.on("before_provider_request", (event, ctx) => {
 		if (!isDeepSeek(ctx.model?.provider, ctx.model?.id)) return;
 		const payload = event.payload as WirePayload | undefined;
@@ -106,7 +97,7 @@ export default function deepseekKvCache(pi: ExtensionAPI) {
 		};
 	});
 
-	// 2. 缓存 Authorization 头；若已有快照但缺密钥则补上（同一请求代）
+	// 2. 缓存 Authorization 头；若已有快照但缺密钥则补上。
 	pi.on("before_provider_headers", (event, ctx) => {
 		if (!isDeepSeek(ctx.model?.provider, ctx.model?.id)) return;
 		const auth = event.headers.authorization ?? event.headers["Authorization"];
@@ -116,14 +107,11 @@ export default function deepseekKvCache(pi: ExtensionAPI) {
 		}
 	});
 
-	// 3. 压缩：摘要请求 = 主对话前缀（逐字不变）+ 尾部指令 → 前缀整体命中缓存
+	// 3. 压缩：只回放 Pi 真正准备丢弃的消息范围，再追加摘要指令。
 	pi.on("session_before_compact", async (event, ctx) => {
 		const { preparation, signal } = event;
-		// 无缓存/密钥 → 退回 pi 默认
 		if (!cache?.payload?.messages?.length || !cache.authHeader) return;
-		// 显式确认当前仍是 DeepSeek 路由
 		if (!isDeepSeek(ctx.model?.provider, ctx.model?.id)) return;
-		// 快照精确匹配：provider + modelId + baseUrl 任一变化都放弃缓存
 		if (
 			cache.provider !== ctx.model?.provider ||
 			cache.modelId !== ctx.model?.id ||
@@ -132,12 +120,33 @@ export default function deepseekKvCache(pi: ExtensionAPI) {
 			return;
 		}
 
+		const messagesToSummarize = [...preparation.messagesToSummarize, ...preparation.turnPrefixMessages];
+		const llmMessagesToSummarize = convertToLlm(messagesToSummarize);
+		if (llmMessagesToSummarize.length === 0) return;
+
+		const cachedMessages = cache.payload.messages;
+		const leadingContextCount = countLeadingContextMessages(cachedMessages);
+		const prefixEnd = leadingContextCount + llmMessagesToSummarize.length;
+
+		// last provider request 可能尚未包含最新 assistant 输出。此时宁可回退默认压缩，
+		// 也不能生成缺失内容的摘要。
+		if (prefixEnd > cachedMessages.length) {
+			stats.fallbacks++;
+			return;
+		}
+
+		const wireConversationPrefix = cachedMessages.slice(leadingContextCount, prefixEnd);
+		if (!rolesMatch(llmMessagesToSummarize, wireConversationPrefix)) {
+			stats.fallbacks++;
+			return;
+		}
+
+		const compactPrefix = cachedMessages.slice(0, prefixEnd);
 		const payload: WirePayload = {
-			...cache.payload, // 键序保持：model, messages, tools, ... → 前缀逐字一致
-			messages: [...cache.payload.messages, { role: "user", content: buildInstruction(preparation) }],
+			...cache.payload,
+			messages: [...compactPrefix, { role: "user", content: buildInstruction(preparation) }],
 			stream: false,
 			max_tokens: SUMMARY_MAX_TOKENS,
-			// thinking 位于 body 尾部，不影响 messages 前缀命中；摘要无需推理
 			thinking: { type: "disabled" },
 		};
 
@@ -181,11 +190,11 @@ export default function deepseekKvCache(pi: ExtensionAPI) {
 			};
 		} catch {
 			stats.fallbacks++;
-			return; // 任何失败退回 pi 默认压缩，不影响功能
+			return;
 		}
 	});
 
-	// 4. 统计主对话请求的缓存命中，并实时更新 footer 状态行
+	// 4. 统计主对话请求缓存命中。
 	pi.on("message_end", (event, ctx) => {
 		if (!isDeepSeek(ctx.model?.provider, ctx.model?.id)) return;
 		const usage = event.message?.usage;
@@ -196,7 +205,7 @@ export default function deepseekKvCache(pi: ExtensionAPI) {
 		renderStatus(ctx);
 	});
 
-	// 5. /dshkv 查看命中统计
+	// 5. /dshkv 查看命中统计。费用随模型/时期变化，不再硬编码估算金额。
 	pi.registerCommand("dshkv", {
 		description: "DeepSeek KV Cache 命中统计",
 		handler: async (_args, ctx) => {
@@ -204,12 +213,10 @@ export default function deepseekKvCache(pi: ExtensionAPI) {
 			const hitRate = total > 0 ? ((stats.cacheReadTokens / total) * 100).toFixed(1) : "0.0";
 			const cTotal = stats.compactInput + stats.compactCacheRead;
 			const cRate = cTotal > 0 ? ((stats.compactCacheRead / cTotal) * 100).toFixed(1) : "0.0";
-			const saved = (stats.compactCacheRead / 1e6) * 0.14; // 命中 vs 全价差约 $0.14/M
 			ctx.ui.notify(
 				[
 					`主对话：${stats.requests} 次请求，输入 ${fmt(total)} tokens，缓存命中 ${fmt(stats.cacheReadTokens)} (${hitRate}%)`,
-					`压缩：${stats.compactRequests} 次前缀复用，命中 ${fmt(stats.compactCacheRead)} (${cRate}%)，回退 ${stats.fallbacks} 次`,
-					...(stats.compactCacheRead > 0 ? [`压缩累计节省约 $${saved.toFixed(3)}`] : []),
+					`压缩：${stats.compactRequests} 次前缀复用，命中 ${fmt(stats.compactCacheRead)} (${cRate}%)，未命中 ${fmt(stats.compactInput)} tokens，回退 ${stats.fallbacks} 次`,
 				].join("\n"),
 				"info",
 			);
@@ -217,15 +224,35 @@ export default function deepseekKvCache(pi: ExtensionAPI) {
 	});
 }
 
+function countLeadingContextMessages(messages: WireMessage[]): number {
+	let count = 0;
+	for (const message of messages) {
+		if (message.role !== "system" && message.role !== "developer") break;
+		count++;
+	}
+	return count;
+}
+
+function rolesMatch(llmMessages: Array<{ role: string }>, wireMessages: WireMessage[]): boolean {
+	if (llmMessages.length !== wireMessages.length) return false;
+	return llmMessages.every((message, index) => normalizeLlmRole(message.role) === wireMessages[index]?.role);
+}
+
+function normalizeLlmRole(role: string): string {
+	return role === "toolResult" ? "tool" : role;
+}
+
 function buildInstruction(preparation: {
 	previousSummary?: string;
+	isSplitTurn?: boolean;
 	fileOps?: { readFiles?: string[]; modifiedFiles?: string[] };
 }): string {
-	const { previousSummary, fileOps } = preparation;
+	const { previousSummary, fileOps, isSplitTurn } = preparation;
 	const readFiles = fileOps?.readFiles ?? [];
 	const modifiedFiles = fileOps?.modifiedFiles ?? [];
 	const parts = [
-		"Summarize the conversation above so that work can continue without it. Structure the summary as:",
+		"Summarize only the conversation messages above. They end exactly at Pi's compaction boundary; newer messages are retained verbatim and are intentionally not included in this request.",
+		"Create a continuation-ready summary with:",
 		"## Goal",
 		"## Constraints & Preferences",
 		"## Progress (Done / In Progress / Blocked)",
@@ -233,8 +260,13 @@ function buildInstruction(preparation: {
 		"## Next Steps",
 		"## Critical Context",
 	];
+	if (isSplitTurn) {
+		parts.push(
+			"The boundary is inside an oversized turn. Capture the in-progress turn prefix precisely so the retained suffix can continue without duplicating or inventing recent work.",
+		);
+	}
 	if (previousSummary) {
-		parts.push(`Previous summary (preserve its content):\n${previousSummary}`);
+		parts.push(`Previous summary (preserve relevant content):\n${previousSummary}`);
 	}
 	if (readFiles.length > 0 || modifiedFiles.length > 0) {
 		parts.push(
@@ -265,7 +297,6 @@ function fmt(n: number): string {
 	return n.toLocaleString("en-US");
 }
 
-/** 与 pi 默认 footer 一致的 token 缩写（1.2k / 45M） */
 function fmtT(n: number): string {
 	if (n < 1000) return n.toString();
 	if (n < 10000) return `${(n / 1000).toFixed(1)}k`;
