@@ -10,9 +10,10 @@ Pi 的 compaction 默认会把旧消息重新序列化后再请求摘要，格�
 
 - `before_provider_request`：缓存 DeepSeek 主对话请求的完整 wire payload（system/messages/tools 等保持原样）。
 - `session_before_compact`：读取 Pi 的 `preparation.messagesToSummarize` 和 `turnPrefixMessages`，通过官方 `convertToLlm()` 计算实际需要摘要的 LLM message 数量。
+- 重复 compaction：如果 `previousSummary` 存在，先确认 provider context 中紧跟 system/developer 的上一轮 compaction-summary 合成消息，再从其后开始对齐 `messagesToSummarize`；上一轮 summary 本身仍保留在复用前缀中，供迭代摘要使用。
 - 对齐校验：同时检查 provider/model/baseUrl 和消息 role 序列。只有 Pi 的待摘要区间能与缓存 wire prefix 安全对齐时才接管 compaction。
-- 精确回放：摘要请求只包含 `system/developer + 待摘要消息`，随后追加摘要指令；recent kept messages 不进入摘要请求。
-- 安全回退：如果上一次 provider request 尚未包含完整待摘要区域，或者 wire role 映射无法确认，扩展直接返回，让 Pi 使用默认 compaction。正确性优先于缓存命中率。
+- 精确回放：摘要请求只包含 `system/developer + 上一轮 summary（如有）+ 待摘要消息`，随后追加摘要指令；recent kept messages 不进入摘要请求。
+- 安全回退：如果上一次 provider request 尚未包含完整待摘要区域、上一轮 summary 无法确认，或者 wire role 映射无法确认，扩展直接返回，让 Pi 使用默认 compaction。正确性优先于缓存命中率。
 - split turn：支持 Pi 的 `turnPrefixMessages`；摘要指令会明确说明边界位于超长 turn 内，保留 suffix 会在摘要后继续存在。
 - `/dshkv`：显示主对话和 compaction 的 cache hit/miss token 统计；不再硬编码美元节省金额，因为模型价格会变化。
 - 状态显示：`dshkv ↑输入 R缓存命中 命中率 | cmp 压缩命中率`，同步写入 footer status 和编辑器下方 widget。
@@ -87,10 +88,11 @@ npm test
 
 覆盖：
 
-1. compaction 请求只包含 Pi 指定的待摘要区间；
-2. `firstKeptEntryId` 后的 recent messages 不会进入 summary request；
-3. system + wire conversation prefix 保持原样；
-4. 缓存快照不足或无法安全对齐时不发额外 API 请求，直接回退 Pi 默认 compaction。
+1. 二次 compaction 能识别上一轮 compaction-summary 合成消息并正确对齐；
+2. compaction 请求只包含 Pi 指定的待摘要区间；
+3. `firstKeptEntryId` 后的 recent messages 不会进入 summary request；
+4. system + previous summary + wire conversation prefix 保持原样；
+5. 缓存快照不足或无法安全对齐时不发额外 API 请求，直接回退 Pi 默认 compaction。
 
 可选运行真实 DeepSeek API prefix-cache 检查：
 
@@ -112,9 +114,10 @@ DeepSeek prefix cache 要求请求前缀一致。Pi 默认 compaction 会重新�
 
 1. 合并 `preparation.messagesToSummarize` 与 `turnPrefixMessages`；
 2. 使用 Pi 官方 `convertToLlm()` 处理 custom/bash/compaction summary 等消息并过滤 `excludeFromContext`；
-3. 计算对应 conversation message 数量；
-4. 将 `toolResult` 映射为 DeepSeek wire role `tool`，逐项验证角色序列；
-5. 只截取验证通过的 wire prefix。
+3. 如果 `previousSummary` 存在，先验证 provider context 里的上一轮 compaction-summary 合成 user message，并把它作为缓存前缀的一部分保留；
+4. 从真正的 `messagesToSummarize` 起点计算对应 conversation message 数量；
+5. 将 `toolResult` 映射为 DeepSeek wire role `tool`，逐项验证角色序列；
+6. 只截取验证通过的 wire prefix。
 
 如果任何一步无法证明边界安全，则不接管 compaction。
 
