@@ -7,8 +7,10 @@
  *    （system + messages + tools 逐字保留）
  * 2. session_before_compact 根据 Pi preparation.messagesToSummarize /
  *    turnPrefixMessages 精确计算需要摘要的消息范围，只回放该 wire 前缀并追加摘要指令
- * 3. 边界无法与 wire payload 安全对齐时，直接回退 Pi 默认 compaction，正确性优先
- * 4. /dshkv 命令查看缓存命中统计
+ * 3. 二次及后续 compaction 会识别 provider context 中上一轮 compaction summary，
+ *    避免它与 messagesToSummarize 的起点错位
+ * 4. 边界无法与 wire payload 安全对齐时，直接回退 Pi 默认 compaction，正确性优先
+ * 5. /dshkv 命令查看缓存命中统计
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -126,7 +128,12 @@ export default function deepseekKvCache(pi: ExtensionAPI) {
 
 		const cachedMessages = cache.payload.messages;
 		const leadingContextCount = countLeadingContextMessages(cachedMessages);
-		const prefixEnd = leadingContextCount + llmMessagesToSummarize.length;
+		const summaryStart = findSummaryStart(cachedMessages, leadingContextCount, preparation.previousSummary);
+		if (summaryStart === undefined) {
+			stats.fallbacks++;
+			return;
+		}
+		const prefixEnd = summaryStart + llmMessagesToSummarize.length;
 
 		// last provider request 可能尚未包含最新 assistant 输出。此时宁可回退默认压缩，
 		// 也不能生成缺失内容的摘要。
@@ -135,12 +142,14 @@ export default function deepseekKvCache(pi: ExtensionAPI) {
 			return;
 		}
 
-		const wireConversationPrefix = cachedMessages.slice(leadingContextCount, prefixEnd);
+		const wireConversationPrefix = cachedMessages.slice(summaryStart, prefixEnd);
 		if (!rolesMatch(llmMessagesToSummarize, wireConversationPrefix)) {
 			stats.fallbacks++;
 			return;
 		}
 
+		// compactPrefix 包含 system/developer；二次 compaction 时也包含上一轮 summary。
+		// 这些内容本来就在主请求前缀中，因此既能命中缓存，也为迭代摘要提供历史上下文。
 		const compactPrefix = cachedMessages.slice(0, prefixEnd);
 		const payload: WirePayload = {
 			...cache.payload,
@@ -233,6 +242,32 @@ function countLeadingContextMessages(messages: WireMessage[]): number {
 	return count;
 }
 
+/**
+ * Pi 在二次 compaction 时，会把上一轮 compaction summary 作为一条合成 user message
+ * 放在当前 provider context 开头，但 preparation.messagesToSummarize 从上一轮 firstKeptEntry
+ * 开始，并不包含这条合成消息。因此有 previousSummary 时必须显式跨过它。
+ */
+function findSummaryStart(
+	messages: WireMessage[],
+	leadingContextCount: number,
+	previousSummary?: string,
+): number | undefined {
+	if (!previousSummary) return leadingContextCount;
+	const previousSummaryMessage = messages[leadingContextCount];
+	if (previousSummaryMessage?.role !== "user") return undefined;
+	if (!contentContainsText(previousSummaryMessage.content, previousSummary)) return undefined;
+	return leadingContextCount + 1;
+}
+
+function contentContainsText(value: unknown, needle: string): boolean {
+	if (typeof value === "string") return value.includes(needle);
+	if (Array.isArray(value)) return value.some((item) => contentContainsText(item, needle));
+	if (value && typeof value === "object") {
+		return Object.values(value as Record<string, unknown>).some((item) => contentContainsText(item, needle));
+	}
+	return false;
+}
+
 function rolesMatch(llmMessages: Array<{ role: string }>, wireMessages: WireMessage[]): boolean {
 	if (llmMessages.length !== wireMessages.length) return false;
 	return llmMessages.every((message, index) => normalizeLlmRole(message.role) === wireMessages[index]?.role);
@@ -243,15 +278,15 @@ function normalizeLlmRole(role: string): string {
 }
 
 function buildInstruction(preparation: {
-	previousSummary?: string;
 	isSplitTurn?: boolean;
 	fileOps?: { readFiles?: string[]; modifiedFiles?: string[] };
 }): string {
-	const { previousSummary, fileOps, isSplitTurn } = preparation;
+	const { fileOps, isSplitTurn } = preparation;
 	const readFiles = fileOps?.readFiles ?? [];
 	const modifiedFiles = fileOps?.modifiedFiles ?? [];
 	const parts = [
 		"Summarize only the conversation messages above. They end exactly at Pi's compaction boundary; newer messages are retained verbatim and are intentionally not included in this request.",
+		"If an earlier compaction summary appears above, merge its relevant context into the new summary instead of treating it as a new user request.",
 		"Create a continuation-ready summary with:",
 		"## Goal",
 		"## Constraints & Preferences",
@@ -264,9 +299,6 @@ function buildInstruction(preparation: {
 		parts.push(
 			"The boundary is inside an oversized turn. Capture the in-progress turn prefix precisely so the retained suffix can continue without duplicating or inventing recent work.",
 		);
-	}
-	if (previousSummary) {
-		parts.push(`Previous summary (preserve relevant content):\n${previousSummary}`);
 	}
 	if (readFiles.length > 0 || modifiedFiles.length > 0) {
 		parts.push(
