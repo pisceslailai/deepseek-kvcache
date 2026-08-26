@@ -3,6 +3,7 @@
  *
  * 默认：纯 mock，不需要 DeepSeek API key。
  * - 精确验证 compaction 只发送 Pi 准备摘要的区间，不包含 kept recent messages
+ * - 验证二次 compaction 能跨过上一轮 compaction summary 后正确对齐
  * - 验证 wire 边界无法安全对齐时回退 Pi 默认 compaction
  *
  * 可选真实 API：
@@ -43,12 +44,17 @@ const ctxMock: any = {
 	ui: { setStatus: () => {}, setWidget: () => {}, notify: () => {} },
 };
 
-async function testExactCompactionRange() {
-	console.log("===== 回归测试：只摘要 Pi 指定区间 =====");
+async function testRepeatedCompactionExactRange() {
+	console.log("===== 回归测试：二次 compaction 精确边界 =====");
 	const { hooks } = makeHarness();
+	const previousSummary = "Earlier compacted context.";
 
 	const wireMessages = [
 		{ role: "system", content: "You are a coding assistant." },
+		{
+			role: "user",
+			content: `The conversation history before this point was compacted into the following summary:\n\n${previousSummary}`,
+		},
 		{ role: "user", content: "old user 1" },
 		{ role: "assistant", content: "old assistant 1" },
 		{ role: "tool", tool_call_id: "call-1", content: "old tool result" },
@@ -95,7 +101,7 @@ async function testExactCompactionRange() {
 		isSplitTurn: true,
 		firstKeptEntryId: "entry-recent-assistant",
 		tokensBefore: 120000,
-		previousSummary: "Earlier compacted context.",
+		previousSummary,
 		fileOps: { readFiles: ["src/index.ts"], modifiedFiles: [] },
 	};
 
@@ -122,16 +128,17 @@ async function testExactCompactionRange() {
 		assert.ok(result?.compaction, "扩展应成功接管 compaction");
 		assert.equal(result.compaction.firstKeptEntryId, preparation.firstKeptEntryId);
 
-		// system + 4 个待摘要 conversation messages + 1 个尾部摘要指令
-		assert.equal(capturedBody.messages.length, 6);
-		assert.deepEqual(capturedBody.messages.slice(0, 5), wireMessages.slice(0, 5));
+		// system + 上一轮 summary + 4 个待摘要 conversation messages + 1 个尾部摘要指令
+		assert.equal(capturedBody.messages.length, 7);
+		assert.deepEqual(capturedBody.messages.slice(0, 6), wireMessages.slice(0, 6));
 		assert.equal(capturedBody.messages.at(-1).role, "user");
 		assert.match(capturedBody.messages.at(-1).content, /compaction boundary/i);
 
 		const serialized = JSON.stringify(capturedBody.messages);
+		assert.ok(serialized.includes(previousSummary), "上一轮 summary 应保留在缓存前缀中");
 		assert.ok(!serialized.includes("RECENT ASSISTANT - MUST BE KEPT"));
 		assert.ok(!serialized.includes("RECENT USER - MUST BE KEPT"));
-		console.log("PASS: kept recent messages 未进入摘要请求，wire 前缀保持原样。\n");
+		console.log("PASS: 上一轮 summary 正确保留，kept recent messages 未进入摘要请求。\n");
 	} finally {
 		globalThis.fetch = originalFetch;
 	}
@@ -230,7 +237,7 @@ async function runLiveCacheCheck() {
 	assert.ok(hit > 0, "真实 API 摘要请求应至少命中部分前缀缓存");
 }
 
-await testExactCompactionRange();
+await testRepeatedCompactionExactRange();
 await testUnsafeBoundaryFallsBack();
 await runLiveCacheCheck();
 console.log("全部测试通过。");
