@@ -1,28 +1,19 @@
 /**
- * deepseek-kvcache 扩展端到端测试
- * 1. 集成测试：mock pi 加载扩展，验证 hook 注册与摘要请求构造逻辑
- * 2. 真实 API 测试：验证扩展构造的摘要请求命中 DeepSeek 前缀缓存，
- *    并与 pi 默认做法（serializeConversation 文本）对照
+ * deepseek-kvcache 回归测试
+ *
+ * 默认：纯 mock，不需要 DeepSeek API key。
+ * - 精确验证 compaction 只发送 Pi 准备摘要的区间，不包含 kept recent messages
+ * - 验证二次 compaction 能跨过上一轮 compaction summary 后正确对齐
+ * - 验证 wire 边界无法安全对齐时回退 Pi 默认 compaction
+ *
+ * 可选真实 API：
+ *   RUN_LIVE=1 DEEPSEEK_API_KEY=... npm test
  */
-import { readFileSync } from "node:fs";
-import { homedir } from "node:os";
-import { join } from "node:path";
+import assert from "node:assert/strict";
+import deepseekKvCache from "../deepseek-kvcache.ts";
 
-const BASE = "https://api.deepseek.com/chat/completions";
 const MODEL = "deepseek-v4-flash";
-const key = JSON.parse(readFileSync(join(homedir(), ".pi/agent/auth.json"), "utf8")).deepseek.key;
-if (!key) throw new Error("未找到 DeepSeek API key");
-
-const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
-
-// ---------- 构造测试对话（模拟 coding 会话，约 3-5k tokens） ----------
-const longText = Array.from(
-	{ length: 40 },
-	(_, i) =>
-		`第${i}段：这是模拟的代码审查与重构对话，讨论模块边界划分、错误处理策略、性能优化手段与测试覆盖率，并包含具体的代码示例和修改建议，供缓存前缀测试使用。`,
-).join("\n");
-
-const system = "You are an AI coding assistant powered by DeepSeek Harness. 遵循项目规范，优先给出代码。";
+const BASE_URL = "https://api.deepseek.com";
 
 const tools = [
 	{
@@ -33,163 +24,220 @@ const tools = [
 			parameters: { type: "object", properties: { path: { type: "string" } }, required: ["path"] },
 		},
 	},
-	{
-		type: "function",
-		function: {
-			name: "bash",
-			description: "执行 shell 命令",
-			parameters: { type: "object", properties: { command: { type: "string" } }, required: ["command"] },
+];
+
+function makeHarness() {
+	const hooks = new Map<string, Function>();
+	let commandHandler: Function | undefined;
+	const pi = {
+		on: (event: string, fn: Function) => hooks.set(event, fn),
+		registerCommand: (_name: string, options: { handler: Function }) => {
+			commandHandler = options.handler;
 		},
-	},
-];
-
-const history = [
-	{ role: "user", content: `${longText}\n\n请审查这段代码并给出修改建议。` },
-	{
-		role: "assistant",
-		content: "我审查了代码，发现三个问题：1) 错误处理缺失 2) 重复逻辑 3) 性能瓶颈。",
-		tool_calls: [
-			{
-				id: "call_1",
-				type: "function",
-				function: { name: "read", arguments: '{"path":"src/index.ts"}' },
-			},
-		],
-	},
-	{ role: "tool", tool_call_id: "call_1", content: "export function main() { /* 500 行代码 */ }" },
-	{ role: "user", content: "好的，按你的建议修改，另外把日志加上。" },
-];
-
-// 摘要指令（与扩展 buildInstruction 一致）
-const instruction = [
-	"Summarize the conversation above so that work can continue without it. Structure the summary as:",
-	"## Goal",
-	"## Constraints & Preferences",
-	"## Progress (Done / In Progress / Blocked)",
-	"## Key Decisions",
-	"## Next Steps",
-	"## Critical Context",
-].join("\n");
-
-async function callApi(body: unknown, label: string) {
-	const res = await fetch(BASE, {
-		method: "POST",
-		headers: { "content-type": "application/json", authorization: `Bearer ${key}` },
-		body: JSON.stringify(body),
-	});
-	if (!res.ok) {
-		console.log(`[${label}] HTTP ${res.status}: ${(await res.text()).slice(0, 200)}`);
-		throw new Error(label);
-	}
-	const data = await res.json();
-	const u = data.usage;
-	console.log(
-		`[${label}] prompt=${u.prompt_tokens} hit=${u.prompt_cache_hit_tokens} miss=${u.prompt_cache_miss_tokens} output=${u.completion_tokens}`,
-	);
-	return u as { prompt_tokens: number; prompt_cache_hit_tokens: number; prompt_cache_miss_tokens: number };
+	};
+	deepseekKvCache(pi as any);
+	return { hooks, getCommandHandler: () => commandHandler };
 }
 
-// ---------- 2. 真实 API：三种请求的缓存命中对照 ----------
-console.log("\n===== 1. 真实 API 缓存命中对照（A 先跑建立干净基线） =====");
-console.log("模型:", MODEL);
-
-// 主对话请求（wire payload）
-const reqA = {
-	model: MODEL,
-	messages: [{ role: "system", content: system }, ...history],
-	tools,
-	stream: true,
-	max_tokens: 384000,
-};
-
-// 请求 A：主对话（首次，预期 hit=0，建立缓存）
-const reqA_api = { ...reqA, stream: false, max_tokens: 256, thinking: { type: "disabled" } };
-const usageA = await callApi(reqA_api, "A 主对话(首次)");
-
-// 请求 B：扩展的摘要请求 = A 前缀逐字 + 尾部指令（预期 hit ≈ A 全部）
-const reqB = {
-	...reqA_api,
-	messages: [...reqA_api.messages, { role: "user", content: instruction }],
-	max_tokens: 512,
-};
-await sleep(300);
-const usageB = await callApi(reqB, "B 扩展摘要(前缀复用)");
-
-// 请求 C：pi 默认做法 = 相同 system + 序列化文本（预期仅命中 system 或 0）
-const serialized = `[run-salt:${Date.now()}]
-` + history
-	.map((m) => `[${m.role === "user" ? "User" : m.role === "assistant" ? "Assistant" : "Tool result"}]: ${(m as any).content}`)
-	.join("\n\n");
-const reqC = {
-	...reqA_api,
-	messages: [
-		{ role: "system", content: system },
-		{ role: "user", content: `${serialized}\n\n${instruction}` },
-	],
-	max_tokens: 512,
-};
-await sleep(300);
-const usageC = await callApi(reqC, "C pi默认(序列化文本)");
-
-
-// ---------- 3. 集成测试（最后跑，验证命中已有缓存）：mock pi 运行扩展 ----------
-console.log("===== 3. 集成测试（最后跑，验证命中已有缓存）：扩展加载与请求构造 =====");
-const extMod = await import("file:///C:/Users/pisce/.pi/agent/extensions/deepseek-kvcache.ts");
-const ext = (extMod as any).default?.default ?? (extMod as any).default;
-
-const hooks = new Map<string, Function>();
-let capturedBody: unknown;
-const pi = {
-	on: (ev: string, fn: Function) => hooks.set(ev, fn),
-	registerCommand: (name: string, _opts: unknown) => console.log(`  注册命令 /${name}`),
-};
-ext(pi);
-console.log(`  注册事件: ${[...hooks.keys()].join(", ")}`);
-
 const ctxMock: any = {
-	model: { provider: "deepseek", id: MODEL, baseUrl: "https://api.deepseek.com" },
-	ui: { setStatus: () => {}, setWidget: () => {} },
+	model: { provider: "deepseek", id: MODEL, baseUrl: BASE_URL },
+	ui: { setStatus: () => {}, setWidget: () => {}, notify: () => {} },
 };
 
-hooks.get("before_provider_request")!({ payload: structuredClone(reqA) }, ctxMock);
-hooks.get("before_provider_headers")!({ headers: { authorization: `Bearer ${key}` } }, ctxMock);
+async function testRepeatedCompactionExactRange() {
+	console.log("===== 回归测试：二次 compaction 精确边界 =====");
+	const { hooks } = makeHarness();
+	const previousSummary = "Earlier compacted context.";
 
-// 触发压缩
-const prep = {
-	firstKeptEntryId: "entry-4",
-	tokensBefore: 5000,
-	previousSummary: undefined,
-	fileOps: { readFiles: ["src/index.ts"], modifiedFiles: [] },
-};
-const compactResult = await hooks.get("session_before_compact")!({ preparation: prep, signal: undefined }, ctxMock);
-console.log(`  压缩结果: ${compactResult ? "接管成功（返回 compaction）" : "未接管（回退 pi 默认）"}`);
-if (!compactResult) throw new Error("扩展未接管压缩");
+	const wireMessages = [
+		{ role: "system", content: "You are a coding assistant." },
+		{
+			role: "user",
+			content: `The conversation history before this point was compacted into the following summary:\n\n${previousSummary}`,
+		},
+		{ role: "user", content: "old user 1" },
+		{ role: "assistant", content: "old assistant 1" },
+		{ role: "tool", tool_call_id: "call-1", content: "old tool result" },
+		{ role: "user", content: "split-turn prefix" },
+		{ role: "assistant", content: "RECENT ASSISTANT - MUST BE KEPT" },
+		{ role: "user", content: "RECENT USER - MUST BE KEPT" },
+	];
+	const mainPayload = {
+		model: MODEL,
+		messages: wireMessages,
+		tools,
+		stream: true,
+		max_tokens: 4096,
+	};
 
-const sentBody = (capturedBody = undefined); // 扩展内部 fetch 无法直接捕获，改为验证返回值结构
-console.log(`  摘要长度: ${compactResult.compaction.summary.length} 字符`);
-console.log(`  firstKeptEntryId 传递: ${compactResult.compaction.firstKeptEntryId}`);
-console.log(`  usage 已记录: ${JSON.stringify(compactResult.compaction.usage)}`);
+	hooks.get("before_provider_request")!({ payload: structuredClone(mainPayload) }, ctxMock);
+	hooks.get("before_provider_headers")!({ headers: { authorization: "Bearer test-key" } }, ctxMock);
 
+	const preparation = {
+		messagesToSummarize: [
+			{ role: "user", content: [{ type: "text", text: "old user 1" }], timestamp: 1 },
+			{
+				role: "assistant",
+				content: [{ type: "text", text: "old assistant 1" }],
+				provider: "deepseek",
+				api: "openai-completions",
+				model: MODEL,
+				stopReason: "toolUse",
+				usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2 },
+				timestamp: 2,
+			},
+			{
+				role: "toolResult",
+				toolCallId: "call-1",
+				toolName: "read",
+				content: [{ type: "text", text: "old tool result" }],
+				isError: false,
+				timestamp: 3,
+			},
+		],
+		turnPrefixMessages: [
+			{ role: "user", content: [{ type: "text", text: "split-turn prefix" }], timestamp: 4 },
+		],
+		isSplitTurn: true,
+		firstKeptEntryId: "entry-recent-assistant",
+		tokensBefore: 120000,
+		previousSummary,
+		fileOps: { readFiles: ["src/index.ts"], modifiedFiles: [] },
+	};
 
-// ---------- 3. 结论 ----------
-console.log("\n===== 3. 结论 =====");
-const rate = (hit: number, total: number) => (total > 0 ? ((hit / total) * 100).toFixed(1) : "0.0");
-const aTotal = usageA.prompt_tokens;
-const bHitRate = rate(usageB.prompt_cache_hit_tokens, usageB.prompt_tokens);
-const bCoverage = rate(usageB.prompt_cache_hit_tokens, aTotal);
-const cHitRate = rate(usageC.prompt_cache_hit_tokens, usageC.prompt_tokens);
+	const originalFetch = globalThis.fetch;
+	let capturedBody: any;
+	globalThis.fetch = (async (_url: string | URL | Request, init?: RequestInit) => {
+		capturedBody = JSON.parse(String(init?.body));
+		return new Response(
+			JSON.stringify({
+				choices: [{ message: { content: "## Goal\nContinue the work." } }],
+				usage: {
+					prompt_tokens: 1100,
+					completion_tokens: 50,
+					prompt_cache_hit_tokens: 1000,
+					prompt_cache_miss_tokens: 100,
+				},
+			}),
+			{ status: 200, headers: { "content-type": "application/json" } },
+		);
+	}) as typeof fetch;
 
-console.log(`A 主对话建立缓存: ${aTotal} tokens`);
-console.log(`B 扩展摘要: 命中 ${usageB.prompt_cache_hit_tokens} tokens，占请求 ${bHitRate}%，覆盖主对话前缀 ${bCoverage}%`);
-console.log(`C pi默认(带盐,全新前缀): 命中 ${usageC.prompt_cache_hit_tokens} tokens，占请求 ${cHitRate}%`);
+	try {
+		const result = await hooks.get("session_before_compact")!({ preparation, signal: undefined }, ctxMock);
+		assert.ok(result?.compaction, "扩展应成功接管 compaction");
+		assert.equal(result.compaction.firstKeptEntryId, preparation.firstKeptEntryId);
 
-const verdict =
-	usageB.prompt_cache_hit_tokens >= aTotal * 0.9
-		? "扩展方案生效：摘要请求完整命中主对话前缀缓存"
-		: usageB.prompt_cache_hit_tokens > 0
-			? "扩展方案部分命中（见数据）"
-			: "扩展方案未命中（需排查）";
-console.log(`\n判定: ${verdict}`);
-console.log(
-	`费用对比（每次压缩，按 1M 前缀估算）: 扩展 ${((aTotal / 1e6) * 0.0028).toFixed(5)}$ vs pi默认 ${((aTotal / 1e6) * 0.14).toFixed(5)}$`,
-);
+		// system + 上一轮 summary + 4 个待摘要 conversation messages + 1 个尾部摘要指令
+		assert.equal(capturedBody.messages.length, 7);
+		assert.deepEqual(capturedBody.messages.slice(0, 6), wireMessages.slice(0, 6));
+		assert.equal(capturedBody.messages.at(-1).role, "user");
+		assert.match(capturedBody.messages.at(-1).content, /compaction boundary/i);
+
+		const serialized = JSON.stringify(capturedBody.messages);
+		assert.ok(serialized.includes(previousSummary), "上一轮 summary 应保留在缓存前缀中");
+		assert.ok(!serialized.includes("RECENT ASSISTANT - MUST BE KEPT"));
+		assert.ok(!serialized.includes("RECENT USER - MUST BE KEPT"));
+		console.log("PASS: 上一轮 summary 正确保留，kept recent messages 未进入摘要请求。\n");
+	} finally {
+		globalThis.fetch = originalFetch;
+	}
+}
+
+async function testUnsafeBoundaryFallsBack() {
+	console.log("===== 回归测试：边界不安全时回退 =====");
+	const { hooks } = makeHarness();
+	const mainPayload = {
+		model: MODEL,
+		messages: [
+			{ role: "system", content: "system" },
+			{ role: "user", content: "only cached message" },
+			{ role: "assistant", content: "cached assistant" },
+		],
+		tools,
+	};
+	// before_provider_request 至少要求 3 条消息，这里满足。
+	hooks.get("before_provider_request")!({ payload: structuredClone(mainPayload) }, ctxMock);
+	hooks.get("before_provider_headers")!({ headers: { authorization: "Bearer test-key" } }, ctxMock);
+
+	const preparation = {
+		messagesToSummarize: [
+			{ role: "user", content: [{ type: "text", text: "one" }], timestamp: 1 },
+			{ role: "user", content: [{ type: "text", text: "two" }], timestamp: 2 },
+			{ role: "user", content: [{ type: "text", text: "three" }], timestamp: 3 },
+		],
+		turnPrefixMessages: [],
+		isSplitTurn: false,
+		firstKeptEntryId: "entry-x",
+		tokensBefore: 100,
+		fileOps: { readFiles: [], modifiedFiles: [] },
+	};
+
+	const originalFetch = globalThis.fetch;
+	let fetchCalled = false;
+	globalThis.fetch = (async () => {
+		fetchCalled = true;
+		throw new Error("不应调用 fetch");
+	}) as typeof fetch;
+	try {
+		const result = await hooks.get("session_before_compact")!({ preparation, signal: undefined }, ctxMock);
+		assert.equal(result, undefined);
+		assert.equal(fetchCalled, false);
+		console.log("PASS: 缓存快照不足以覆盖摘要范围时安全回退 Pi 默认 compaction。\n");
+	} finally {
+		globalThis.fetch = originalFetch;
+	}
+}
+
+async function runLiveCacheCheck() {
+	if (process.env.RUN_LIVE !== "1") return;
+	const key = process.env.DEEPSEEK_API_KEY;
+	if (!key) throw new Error("RUN_LIVE=1 时必须设置 DEEPSEEK_API_KEY");
+
+	console.log("===== 可选真实 API：前缀缓存命中 =====");
+	const longText = Array.from(
+		{ length: 60 },
+		(_, i) => `第${i}段：模拟 coding agent 长上下文，用于 DeepSeek KV Cache 前缀复用测试。`,
+	).join("\n");
+	const prefixMessages = [
+		{ role: "system", content: "You are a coding assistant." },
+		{ role: "user", content: longText },
+		{ role: "assistant", content: "已分析代码结构并记录关键修改点。" },
+		{ role: "user", content: "继续处理测试。" },
+	];
+	const base = {
+		model: MODEL,
+		messages: prefixMessages,
+		tools,
+		stream: false,
+		max_tokens: 128,
+		thinking: { type: "disabled" },
+	};
+
+	async function call(body: unknown) {
+		const res = await fetch(`${BASE_URL}/chat/completions`, {
+			method: "POST",
+			headers: { "content-type": "application/json", authorization: `Bearer ${key}` },
+			body: JSON.stringify(body),
+		});
+		assert.equal(res.ok, true, `DeepSeek HTTP ${res.status}`);
+		return (await res.json()) as any;
+	}
+
+	const first = await call(base);
+	const second = await call({
+		...base,
+		messages: [...prefixMessages, { role: "user", content: "Summarize only the conversation above." }],
+		max_tokens: 256,
+	});
+	const hit = second.usage?.prompt_cache_hit_tokens ?? 0;
+	const total = second.usage?.prompt_tokens ?? 0;
+	console.log(`首次 prompt=${first.usage?.prompt_tokens ?? 0}`);
+	console.log(`摘要请求 prompt=${total}, cache hit=${hit}, hit rate=${total ? ((hit / total) * 100).toFixed(1) : "0.0"}%`);
+	assert.ok(hit > 0, "真实 API 摘要请求应至少命中部分前缀缓存");
+}
+
+await testRepeatedCompactionExactRange();
+await testUnsafeBoundaryFallsBack();
+await runLiveCacheCheck();
+console.log("全部测试通过。");
