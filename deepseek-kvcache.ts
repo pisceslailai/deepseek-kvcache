@@ -64,7 +64,7 @@ export default function deepseekKvCache(pi: ExtensionAPI) {
 		fallbacks: 0,
 	};
 
-	/** 渲染状态：footer 状态行 + 编辑器下方 widget。 */
+	/** 渲染状态：仅写 footer 状态行，避免与编辑器下方 widget 重复占行。 */
 	const renderStatus = (ctx: {
 		ui?: {
 			setStatus?(key: string, text: string | undefined): void;
@@ -81,7 +81,7 @@ export default function deepseekKvCache(pi: ExtensionAPI) {
 		}
 		const text = `dshkv ${parts.join(" ")}`;
 		ctx.ui?.setStatus?.("dshkv", text);
-		ctx.ui?.setWidget?.("dshkv", [text], { placement: "belowEditor" });
+		ctx.ui?.setWidget?.("dshkv", undefined);
 	};
 
 	// 1. 缓存主对话请求 wire payload，并绑定 provider/model/baseUrl/key。

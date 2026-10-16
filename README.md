@@ -16,7 +16,7 @@ Pi 的 compaction 默认会把旧消息重新序列化后再请求摘要，格�
 - 安全回退：如果上一次 provider request 尚未包含完整待摘要区域、上一轮 summary 无法确认，或者 wire role 映射无法确认，扩展直接返回，让 Pi 使用默认 compaction。正确性优先于缓存命中率。
 - split turn：支持 Pi 的 `turnPrefixMessages`；摘要指令会明确说明边界位于超长 turn 内，保留 suffix 会在摘要后继续存在。
 - `/dshkv`：显示主对话和 compaction 的 cache hit/miss token 统计；不再硬编码美元节省金额，因为模型价格会变化。
-- 状态显示：`dshkv ↑输入 R缓存命中 命中率 | cmp 压缩命中率`，同步写入 footer status 和编辑器下方 widget。
+- 状态显示：`dshkv ↑输入 R缓存命中 命中率 | cmp 压缩命中率`，写入 footer status 行；`powerline-footer` 等自定义 footer 会通过 `footerData.getExtensionStatuses()` 消费这些状态，无需再额外渲染一遍编辑器下方 widget。
 - 仅对 DeepSeek 路由生效（`provider === "deepseek"` 或模型 id 含 `deepseek`）；自定义兼容端点使用 `ctx.model.baseUrl`。
 
 ## 为什么不能直接摘要整段主对话
